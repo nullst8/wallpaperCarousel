@@ -1,0 +1,16 @@
+#!/bin/sh
+# Wallpaper Carousel IPC shim.
+#
+# Resolves its own directory so keybindings can be short no matter where the
+# shell is installed:
+#
+#   wallpaper-carousel toggle
+#   wallpaper-carousel open | close
+#   wallpaper-carousel cycleNext | cyclePrevious
+#   wallpaper-carousel openOn <output> | toggleOn <output> | ...
+#
+# All commands (plus toggle/open/close/cycle* without the On suffix) are
+# declared in Carousel.qml's IpcHandler.
+
+dir="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+exec qs -p "$dir" ipc call wallpaperCarousel "$@"

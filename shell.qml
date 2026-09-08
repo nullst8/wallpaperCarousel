@@ -1,52 +1,262 @@
 import QtQuick
 import Quickshell
 import Quickshell.Io
+import Quickshell.Hyprland
 
-// Standalone Quickshell entry point for the Noctalia v5 integration.
+// Standalone Quickshell entry point.
 //
-// Noctalia v5 is a native C++ shell with no QML runtime, so this file is not
-// loaded *by* Noctalia the way Main.qml (v4) and WallpaperCarousel.qml (DMS) are.
-// It is a separate `qs -p .../shell.qml` process started and owned by the
-// wallpaper-carousel.luau service. Where those adapters bind Carousel's interface
-// straight to a live Settings/SessionData singleton in the same process, this one
-// has no singleton to bind to: everything comes in through one JSON file the
-// service writes and this file watches.
+// This shell owns the whole wallpaper pipeline itself: it watches a JSON config
+// file for settings, tracks the current wallpaper per output by asking awww
+// (an swww fork) and by remembering its own picks, applies picks through
+// `awww img`, and finds the focused output via Hyprland's IPC.
 //
-//   host-state.json  →  settings, wallpaper directory, current wallpaper per
-//                       output, and a sequence-numbered command. A command runs
-//                       when `seq` changes, which also covers the startup case:
-//                       the service writes the command *before* launching us, so
-//                       the very first open is not lost to a socket that is not
-//                       listening yet.
+//   qs -p <this directory>  — start it (login-time daemon)
+//   qs -p <dir> ipc call wallpaperCarousel toggle|open|close|cycleNext|…
+//                           — the command surface (declared in Carousel.qml)
 //
-//   noctalia msg     →  back the other way, for the two things this process
-//                       cannot do itself: applying a wallpaper (v5 renders
-//                       wallpapers natively and exposes no IPC command for it —
-//                       only the plugin's Luau side can call setWallpaper) and
-//                       reporting overlay visibility for the Control Center
-//                       shortcut's toggle state.
+// Config lives in ${XDG_CONFIG_HOME:-~/.config}/wallpaperCarousel/settings.json.
+// The file is optional: every key has a default here, and watching the file
+// means edits apply live — no restart needed.
+
 ShellRoot {
     id: root
 
-    // ── State pushed in by wallpaper-carousel.luau ─────────────────────────────
+    // ── Paths ─────────────────────────────────────────────────────────────────
 
-    // Plugin settings, mirroring plugin.toml's [[setting]] keys.
-    property var pluginConfig: ({})
+    readonly property string home: Quickshell.env("HOME") || "/tmp"
+    readonly property string configHome: Quickshell.env("XDG_CONFIG_HOME") || (root.home + "/.config")
+    readonly property string configPath: root.configHome + "/wallpaperCarousel/settings.json"
 
-    // wallpaperDirectory must never be "": FolderListModel resolves an empty — or
-    // even a nonexistent — folder by silently scanning this process's working
-    // directory instead, so until the host names a real one, fall back to
-    // something guaranteed to exist.
-    readonly property string _fallbackDirectory: Quickshell.env("HOME") || "/tmp"
-    property string wallpaperDirectory: root._fallbackDirectory
-    property var currentWallpaperByScreen: ({})  // { [outputName]: path }; "" = the shell-wide default
-    property var extraWallpaperDirectories: []
-    property bool wallpaperConfigured: false
+    // ── Settings ──────────────────────────────────────────────────────────────
+    //
+    // Defaults mirror the plugin builds' manifest. `expandSelected` and
+    // `enableHoldExpand` accept booleans here; Carousel also tolerates the
+    // string forms used by the old plugin manifests.
 
-    // Set from the state file so the reply address is never hardcoded here.
-    property string serviceEntryId: "yngwe/wallpaperCarousel:service"
+    readonly property var configDefaults: ({
+        wallpaperDirectory: "",
+        carouselMode: "wrap",
+        applyToAllMonitors: true,
+        overlayOpacity: 80,
+        borderWidth: 3,
+        cornerRadius: 0,
+        itemWidth: 300,
+        itemHeight: 420,
+        selectedScale: 108,
+        expandSelected: false,
+        expandMultiplier: 120,
+        enableHoldExpand: false,
+        holdExpandRatio: 35,
+        holdDelay: 1500,
+        cacheSize: 30,
+        // awww transition applied on pick. transitionType "grow" grows a circle
+        // from transitionPos; "" on duration/fps/pos leaves the daemon default.
+        transitionType: "grow",
+        transitionPos: "center",
+        transitionDuration: "",
+        transitionFps: "",
+        // Optional per-output wallpaper directories, e.g. { "DP-1": "~/walls" }.
+        monitorDirectories: {}
+    })
 
-    property int lastCommandSeq: -1
+    property var userConfig: ({})
+
+    // Merged, with `~` expansion done here: Carousel feeds wallpaperDirectory
+    // straight into a FolderListModel as `file://` + path, where a literal `~`
+    // silently resolves to nothing.
+    readonly property var cfg: {
+        const merged = Object.assign({}, root.configDefaults, root.userConfig);
+        merged.wallpaperDirectory = root.expandPath(String(merged.wallpaperDirectory ?? "").trim());
+        return merged;
+    }
+
+    function expandPath(path) {
+        const p = String(path ?? "");
+        if (p === "~")
+            return root.home;
+        if (p.startsWith("~/"))
+            return root.home + p.substring(1);
+        return p;
+    }
+
+    // watchChanges cannot watch a file that does not exist yet, so a config
+    // created after startup is found by polling until the first successful
+    // load; from then on the file watcher takes over.
+    Timer {
+        id: configWatchTimer
+        interval: 2000
+        repeat: true
+        onTriggered: configFile.reload()
+    }
+
+    FileView {
+        id: configFile
+        path: root.configPath
+        watchChanges: true
+
+        onFileChanged: reload()
+        onLoaded: {
+            configWatchTimer.stop();
+            root.readConfig();
+        }
+        onLoadFailed: configWatchTimer.start()
+    }
+
+    // The file may be written non-atomically; retry briefly on a bad read.
+    Timer {
+        id: configRetryTimer
+        interval: 120
+        onTriggered: configFile.reload()
+    }
+
+    function readConfig() {
+        try {
+            const parsed = JSON.parse(configFile.text());
+            root.userConfig = (parsed && typeof parsed === "object" && !Array.isArray(parsed)) ? parsed : {};
+            console.info("wallpaperCarousel: config loaded — directory: '" + root.cfg.wallpaperDirectory
+                + "', mode: " + root.cfg.carouselMode);
+        } catch (e) {
+            configRetryTimer.restart();
+        }
+    }
+
+    // ── Current wallpaper state ───────────────────────────────────────────────
+    //
+    // { [outputName]: path }, with "" as the shell-wide default — the same shape
+    // the Noctalia v5 host pushed in. Seeded from `awww query`, refreshed each
+    // time the overlay opens (so wallpapers changed by other tools are picked
+    // up), and updated immediately on every pick (the daemon's own answer can
+    // lag behind the just-issued `awww img`).
+
+    property var currentWallpaperByScreen: ({})
+
+    function monitorDirectory(screenName) {
+        if (!screenName)
+            return "";
+        const dirs = root.cfg.monitorDirectories ?? {};
+        const dir = dirs[screenName];
+        return dir ? root.expandPath(String(dir).trim()) : "";
+    }
+
+    // Browsing directory when the user has not overridden wallpaperDirectory:
+    // the per-output directory for the screen being browsed, else the directory
+    // of the current wallpaper (matching the DMS build's "follow the wallpaper"
+    // default), else ~/Pictures.
+    function defaultWallpaperFolderFor(screenName) {
+        const perMonitor = root.monitorDirectory(screenName);
+        if (perMonitor)
+            return perMonitor;
+
+        const current = root.currentWallpaperByScreen[screenName]
+            ?? root.currentWallpaperByScreen[""] ?? "";
+        if (current) {
+            const slash = current.lastIndexOf('/');
+            if (slash > 0)
+                return current.substring(0, slash);
+        }
+
+        return root.home + "/Pictures";
+    }
+
+    Process {
+        id: queryProcess
+        command: ["awww", "query"]
+
+        stdout: StdioCollector {
+            onStreamFinished: root.applyQueryResult(this.text)
+        }
+
+        // Daemon down? Start it once and try again; a login-time race with the
+        // compositor's own autostart is the usual cause.
+        onExited: (code, status) => {
+            if (code !== 0 && !root.daemonRestartAttempted) {
+                root.daemonRestartAttempted = true;
+                console.warn("wallpaperCarousel: awww query failed, starting awww-daemon");
+                Quickshell.execDetached(["awww-daemon"]);
+                daemonStartTimer.start();
+            }
+        }
+    }
+
+    property bool daemonRestartAttempted: false
+
+    Timer {
+        id: daemonStartTimer
+        interval: 800
+        onTriggered: root.refreshWallpaperState()
+    }
+
+    function refreshWallpaperState() {
+        queryProcess.running = true;
+    }
+
+    // `awww query` lines look like:
+    //   eDP-1: 1920x1200, scale: 1, currently displaying: image: /path/to/img.jpg
+    function applyQueryResult(text) {
+        const next = Object.assign({}, root.currentWallpaperByScreen);
+        let changed = false;
+        for (const line of String(text ?? "").split("\n")) {
+            const m = line.match(/^([^:]+):.*currently displaying: image: (.+)$/);
+            if (m && next[m[1].trim()] !== m[2].trim()) {
+                next[m[1].trim()] = m[2].trim();
+                changed = true;
+            }
+        }
+        if (changed)
+            root.currentWallpaperByScreen = next;
+
+        // The query is asynchronous, so an open that raced it may have focused
+        // the wrong tile. Re-run the focus logic once the answer lands — the
+        // first snap runs at zero duration, so this is invisible.
+        if (changed && carousel.overlayVisible)
+            carousel.open();
+    }
+
+    // ── Applying a pick ───────────────────────────────────────────────────────
+
+    function applyPick(fullPath, screenName) {
+        if (!fullPath)
+            return;
+
+        const path = root.expandPath(fullPath);
+        const args = ["img"];
+
+        // Without -o, awww displays the image on every output.
+        if (root.cfg.applyToAllMonitors !== true && screenName)
+            args.push("-o", screenName);
+
+        const type = String(root.cfg.transitionType ?? "").trim();
+        if (type) {
+            args.push("--transition-type", type);
+            const pos = String(root.cfg.transitionPos ?? "").trim();
+            if (pos)
+                args.push("--transition-pos", pos);
+        }
+        const duration = String(root.cfg.transitionDuration ?? "").trim();
+        if (duration)
+            args.push("--transition-duration", duration);
+        const fps = String(root.cfg.transitionFps ?? "").trim();
+        if (fps)
+            args.push("--transition-fps", fps);
+
+        args.push(path);
+        Quickshell.execDetached(["awww"].concat(args));
+
+        // Mirror the pick into memory right away so the next open highlights the
+        // new image even if `awww query` would still answer with the old one.
+        if (root.cfg.applyToAllMonitors === true || !screenName) {
+            const all = { "": path };
+            for (let i = 0; i < Quickshell.screens.length; i++)
+                all[Quickshell.screens[i].name] = path;
+            root.currentWallpaperByScreen = all;
+        } else {
+            const next = Object.assign({}, root.currentWallpaperByScreen);
+            next[screenName] = path;
+            root.currentWallpaperByScreen = next;
+        }
+    }
+
+    // ── Focused output ────────────────────────────────────────────────────────
 
     function findScreen(name) {
         if (!name)
@@ -58,138 +268,83 @@ ShellRoot {
         return null;
     }
 
-    // Fire-and-forget event back to the Luau service. `noctalia msg` joins its
-    // trailing arguments with spaces and the plugin router takes everything after
-    // the event name as the payload, so a single JSON argument survives intact.
-    function notifyService(event, payload) {
-        Quickshell.execDetached(["noctalia", "msg", "plugin", root.serviceEntryId, "all", event, JSON.stringify(payload ?? {})]);
-    }
+    function getFocusedScreen(hint) {
+        const byHint = root.findScreen(hint);
+        if (byHint)
+            return byHint;
 
-    function applyCommand(command, screenName) {
-        switch (command) {
-        case "open":
-            carousel.pendingScreenName = screenName;
-            if (!carousel.overlayVisible)
-                carousel.open();
-            break;
-        case "close":
-            if (carousel.overlayVisible)
-                carousel.close();
-            break;
-        case "toggle":
-            carousel.pendingScreenName = screenName;
-            carousel.toggle();
-            break;
-        case "next":
-            carousel.pendingScreenName = screenName;
-            carousel.cycle(+1);
-            break;
-        case "prev":
-            carousel.pendingScreenName = screenName;
-            carousel.cycle(-1);
-            break;
-        case "quit":
-            Qt.quit();
-            break;
-        case "":
-        case undefined:
-            break;                       // state-only refresh
-        default:
-            console.warn("wallpaperCarousel: unknown command '" + command + "'");
+        // Hyprland: the focused monitor is tracked live, no subprocess needed.
+        // Off Hyprland this is simply null.
+        const hypr = Hyprland.focusedMonitor;
+        if (hypr) {
+            const screen = root.findScreen(hypr.name);
+            if (screen)
+                return screen;
         }
-    }
 
-    function applyState(state) {
-        root.pluginConfig = state.config ?? {};
-        root.wallpaperDirectory = (state.wallpaperDirectory ?? "").trim() || root._fallbackDirectory;
-        root.currentWallpaperByScreen = state.currentWallpaper ?? {};
-        // An empty Lua table serializes to `{}`, not `[]`, so coerce rather than
-        // handing a bare object to the Repeater that pre-scans these.
-        root.extraWallpaperDirectories = Array.isArray(state.extraDirectories) ? state.extraDirectories : [];
-        root.wallpaperConfigured = !!state.wallpaperConfigured;
-        if (state.entryId)
-            root.serviceEntryId = state.entryId;
-
-        const seq = state.seq ?? 0;
-        if (seq !== root.lastCommandSeq) {
-            root.lastCommandSeq = seq;
-            // Settings above are applied first so a command that opens the
-            // overlay already sees the directory it should be browsing.
-            Qt.callLater(() => root.applyCommand(state.command ?? "", state.screen ?? ""));
+        // Generic fallback: whichever output holds the pointer. Older
+        // Quickshells lack cursorPos; the property access is then undefined.
+        const pos = Quickshell.cursorPos;
+        if (pos !== undefined) {
+            for (const screen of Quickshell.screens) {
+                if (pos.x >= screen.x && pos.x < screen.x + screen.width
+                    && pos.y >= screen.y && pos.y < screen.y + screen.height)
+                    return screen;
+            }
         }
+
+        return Quickshell.screens[0] ?? null;
     }
 
-    // The service resolves this (it owns the plugin data dir) and hands it over in
-    // the environment, so this process needs no knowledge of Noctalia's directory
-    // layout. The literal fallback only exists so `qs -p shell.qml` by hand, for
-    // debugging, still finds the file a running service is writing.
-    readonly property string statePath: Quickshell.env("WALLPAPER_CAROUSEL_STATE")
-        || ((Quickshell.env("HOME") || "") + "/.local/state/noctalia/plugins/data/yngwe/wallpaperCarousel/host-state.json")
-
-    FileView {
-        id: stateFile
-        path: root.statePath
-        watchChanges: true
-
-        onFileChanged: reload()
-        onLoaded: root.readState()
-        onLoadFailed: error => console.warn("wallpaperCarousel: cannot read " + root.statePath + ": " + error)
-    }
-
-    // The service writes this file in place rather than atomically, so a read can
-    // land mid-write and fail to parse. That is transient by definition — retry
-    // shortly rather than dropping the update.
-    Timer {
-        id: retryTimer
-        interval: 120
-        onTriggered: stateFile.reload()
-    }
-
-    function readState() {
-        try {
-            root.applyState(JSON.parse(stateFile.text()));
-        } catch (e) {
-            retryTimer.restart();
-        }
-    }
+    // ── The carousel ──────────────────────────────────────────────────────────
 
     Carousel {
         id: carousel
 
-        wlrNamespace: "noctalia:plugins:wallpaperCarousel"
-        cfg: root.pluginConfig
+        wlrNamespace: "wallpaperCarousel"
+        cfg: root.cfg
 
-        // This process has no compositor connection of its own to detect focus
-        // with, so the focused output is whatever the service told us when it
-        // wrote the command. Fall back to the first known screen so a bare
-        // `qs -p shell.qml` still opens somewhere.
-        getFocusedScreen: hint => root.findScreen(hint) ?? (Quickshell.screens[0] ?? null)
+        getFocusedScreen: hint => root.getFocusedScreen(hint)
 
-        defaultWallpaperFolder: root.wallpaperDirectory
-        extraDirectories: root.extraWallpaperDirectories
-        hasWallpaperConfigured: root.wallpaperConfigured
+        defaultWallpaperFolder: root.defaultWallpaperFolderFor(carousel.overlayScreen?.name ?? "")
+
+        // Pre-scan the other outputs' directories so per-monitor browsing does
+        // not re-read the disk.
+        extraDirectories: {
+            const browsing = carousel.defaultWallpaperFolder;
+            const dirs = [];
+            for (const name in (root.cfg.monitorDirectories ?? {})) {
+                const dir = root.monitorDirectory(name);
+                if (dir && dir !== browsing && dirs.indexOf(dir) < 0)
+                    dirs.push(dir);
+            }
+            return dirs;
+        }
+
+        hasWallpaperConfigured: root.cfg.wallpaperDirectory !== ""
+            || Object.values(root.currentWallpaperByScreen).some(path => !!path)
+            || Object.keys(root.cfg.monitorDirectories ?? {}).length > 0
 
         currentWallpaperPath: {
             const name = carousel.overlayScreen?.name ?? "";
             return root.currentWallpaperByScreen[name] ?? root.currentWallpaperByScreen[""] ?? "";
         }
 
-        shellSettingsHint: "Open Noctalia Settings → Wallpaper,\nand select a wallpaper directory."
+        shellSettingsHint: "Set wallpaperDirectory in\n" + root.configPath
 
-        onWallpaperPicked: (fullPath, screenName) => {
-            root.notifyService("picked", {
-                path: fullPath,
-                screen: screenName ?? ""
-            });
+        onWallpaperPicked: (fullPath, screenName) => root.applyPick(fullPath, screenName)
+
+        onOverlayVisibleChanged: {
+            if (carousel.overlayVisible)
+                root.refreshWallpaperState();
         }
-
-        onOverlayVisibleChanged: root.notifyService(carousel.overlayVisible ? "opened" : "closed", {})
     }
 
     // ── Host plumbing IPC ─────────────────────────────────────────────────────
     // Kept on its own target, separate from Carousel's user-facing
-    // "wallpaperCarousel" handler (toggle/open/close/cycle…), so the service's
-    // liveness probe and shutdown request never collide with a user command.
+    // "wallpaperCarousel" handler, so scripts and probes never collide with a
+    // user command.
+
     IpcHandler {
         target: "wallpaperCarouselHost"
 
@@ -201,5 +356,16 @@ ShellRoot {
             Qt.quit();
             return "quitting";
         }
+
+        // Scriptable wallpaper set: `qs -p <dir> ipc call wallpaperCarouselHost apply <path>`.
+        function apply(path: string): string {
+            root.applyPick(path, root.getFocusedScreen("")?.name ?? "");
+            return "applied";
+        }
+    }
+
+    Component.onCompleted: {
+        root.refreshWallpaperState();
+        console.info("WallpaperCarousel: standalone daemon loaded — 'qs -p <dir> ipc call wallpaperCarousel toggle' to open");
     }
 }

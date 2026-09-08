@@ -310,7 +310,7 @@ Item {
 
         Rectangle {
             anchors.fill: parent
-            color: "#CC000000"
+            color: "#000000"
             opacity: overlay.visible ? carousel.overlayOpacity / 100 : 0
             Behavior on opacity {
                 NumberAnimation {
@@ -849,7 +849,7 @@ Item {
             }
             Text {
                 anchors.horizontalCenter: parent.horizontalCenter
-                text: "The configured directory '" + (root.cfg.wallpaperDirectory ?? "") + "' does not exist.\nCheck the path in Wallpaper Carousel settings."
+                text: "The configured directory '" + (root.cfg.wallpaperDirectory ?? "") + "' does not exist.\nCheck wallpaperDirectory in ~/.config/wallpaperCarousel/settings.json"
                 font.pixelSize: 14
                 color: "#BBBBBB"
                 horizontalAlignment: Text.AlignHCenter
